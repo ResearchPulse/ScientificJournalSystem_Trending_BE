@@ -87,4 +87,23 @@ export const requireAuth = async (req, res, ...rest) => {
   }
 };
 
+export const optionalAuth = async (req, res, ...rest) => {
+  const next = typeof rest[0] === 'function' ? rest[0] : null;
+  try {
+    const token = extractAccessTokenFromRequest(req);
+    if (token) {
+      const { userId, payload } = getAuthenticatedUserId(req);
+      req.user = {
+        ...payload,
+        user_id: userId,
+        payload
+      };
+    }
+  } catch {
+    // Bỏ qua lỗi với optional auth, cho phép tiếp tục
+  }
+  if (next) next();
+};
+
+
 
