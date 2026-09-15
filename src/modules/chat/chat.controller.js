@@ -356,7 +356,7 @@ export const updateChatMessageHandler = async (request, reply) => {
       return reply.status(400).send({ success: false, message: 'projectId or messageId is invalid' });
     }
 
-    const message = await updateChatMessage(messageId, projectId, userId, request.body);
+    const message = await updateChatMessage(messageId, projectId, request.body, userId);
     if (!message) {
       return reply.status(404).send({ success: false, message: 'Chat message not found' });
     }
@@ -389,16 +389,73 @@ export const deleteChatMessageHandler = async (request, reply) => {
 export const clearChatHistory = async (request, reply) => {
   try {
     const projectId = parseProjectId(request.params.projectId);
-    const userId = request.user?.user_id;
+    const rawUserId = request.user?.user_id || null;
+    const userId = isValidUuid(rawUserId) ? rawUserId : null;
 
     if (!projectId) {
       return reply.status(400).send({ success: false, message: 'projectId is invalid' });
     }
 
     const result = await deleteProjectChatMessages(projectId, userId);
+
+    // Đồng bộ reset context memory bên Rag_System_AI
+    try {
+      const rawBaseUrl = process.env.RAG_SERVICE_URL || 'http://127.0.0.1:8001';
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      const params = new URLSearchParams();
+      params.append('project_id', String(projectId));
+      if (userId) params.append('user_id', String(userId));
+      await fetch(`${baseUrl}/api/v1/chat/context/reset?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      logger.info(`[CHAT CLEAR] Đã xóa context memory bên Rag_System_AI cho Project ID: ${projectId}`);
+    } catch (ragError) {
+      logger.warn('[CHAT CLEAR] Không thể gọi reset context tới Rag_System_AI:', ragError?.message || ragError);
+    }
+
     return reply.status(200).send({ success: true, ...result });
   } catch (error) {
     logger.error('[CHAT MESSAGE] Lỗi xóa lịch sử chat:', error);
     return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi xóa lịch sử chat.' });
+  }
+};
+
+/**
+ * Tạo mới phiên trò chuyện: reset context memory bên AI mà không nhất thiết phải xóa dữ liệu cũ
+ */
+export const resetChatConversation = async (request, reply) => {
+  try {
+    const projectId = parseProjectId(request.params.projectId);
+    const rawUserId = request.user?.user_id || request.body?.user_id || null;
+    const userId = isValidUuid(rawUserId) ? rawUserId : null;
+
+    if (!projectId) {
+      return reply.status(400).send({ success: false, message: 'projectId is invalid' });
+    }
+
+    // Gửi yêu cầu reset context memory sang Rag_System_AI
+    try {
+      const rawBaseUrl = process.env.RAG_SERVICE_URL || 'http://127.0.0.1:8001';
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      const params = new URLSearchParams();
+      params.append('project_id', String(projectId));
+      if (userId) params.append('user_id', String(userId));
+      await fetch(`${baseUrl}/api/v1/chat/context/reset?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      logger.info(`[CHAT RESET] Đã reset working context memory cho Project ID: ${projectId}`);
+    } catch (ragError) {
+      logger.warn('[CHAT RESET] Không thể gọi reset context tới Rag_System_AI:', ragError?.message || ragError);
+    }
+
+    return reply.status(200).send({
+      success: true,
+      message: 'Bắt đầu phiên trò chuyện mới thành công.'
+    });
+  } catch (error) {
+    logger.error('[CHAT RESET] Lỗi tạo mới cuộc trò chuyện:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi tạo mới cuộc trò chuyện.' });
   }
 };

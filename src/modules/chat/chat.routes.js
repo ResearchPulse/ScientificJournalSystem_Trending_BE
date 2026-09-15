@@ -6,6 +6,7 @@ import {
   deleteChatMessageHandler,
   getChatHistory,
   getChatMessageDetail,
+  resetChatConversation,
   updateChatMessageHandler
 } from './chat.controller.js';
 import { requireAuth, optionalAuth } from '../auth/auth.middleware.js';
@@ -320,9 +321,10 @@ fastify.post('/chat', { preHandler: [optionalAuth, chatRateLimiter] }, chatRagSy
  *                   type: integer
  *                   example: 10
  */
-fastify.post('/projects/:projectId/chat/messages', { preHandler: [requireAuth] }, createChatMessageHandler);
-fastify.get('/projects/:projectId/chat/messages', { preHandler: [requireAuth] }, getChatHistory);
-fastify.delete('/projects/:projectId/chat/messages', { preHandler: [requireAuth] }, clearChatHistory);
+fastify.post('/projects/:projectId/chat/messages', { preHandler: [optionalAuth] }, createChatMessageHandler);
+fastify.get('/projects/:projectId/chat/messages', { preHandler: [optionalAuth] }, getChatHistory);
+fastify.delete('/projects/:projectId/chat/messages', { preHandler: [optionalAuth] }, clearChatHistory);
+fastify.post('/projects/:projectId/chat/reset', { preHandler: [optionalAuth] }, resetChatConversation);
 
 /**
  * @openapi
