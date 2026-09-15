@@ -3,12 +3,18 @@ import analyticsRoutes from './analytics/analytics.routes.js';
 import dashboardRoutes from './dashboard/dashboard.routes.js';
 import searchRoutes from './search/search.routes.js';
 import chatRoutes from './chat/chat.routes.js';
-import { requireAuth } from './auth/auth.middleware.js';
+import { requireAuth, optionalAuth } from './auth/auth.middleware.js';
 import { ensureProjectScope } from './analytics/services/scope.service.js';
 
 export default async function (fastify) {
-  // 1. Kiểm tra xác thực Account từ cookies cho toàn bộ các module API
-  fastify.addHook('preHandler', requireAuth);
+  // 1. Kiểm tra xác thực Account: Riêng /chat hỗ trợ optionalAuth cho phép guest/chatbot không bị chặn 401
+  fastify.addHook('preHandler', async (request, reply) => {
+    if (request.url.includes('/chat')) {
+      await optionalAuth(request, reply);
+      return;
+    }
+    await requireAuth(request, reply);
+  });
 
   // 2. Tự động kiểm tra và khởi tạo phạm vi bài báo cho project nếu có project_id
   fastify.addHook('preHandler', async (request, reply) => {

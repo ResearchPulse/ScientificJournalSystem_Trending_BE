@@ -7,6 +7,10 @@ vi.mock('../../src/modules/auth/auth.middleware.js', () => ({
     req.user = { user_id: '123', role: 'STUDENT' };
     if (typeof rest[0] === 'function') rest[0]();
   }),
+  optionalAuth: vi.fn(async (req, res, ...rest) => {
+    req.user = { user_id: '123', role: 'STUDENT' };
+    if (typeof rest[0] === 'function') rest[0]();
+  }),
 }));
 
 vi.mock('../../src/modules/search/services/search/graph.service.js', () => ({

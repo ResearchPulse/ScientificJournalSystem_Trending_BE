@@ -42,7 +42,7 @@ const saveChatMessageSafely = async (payload) => {
   try {
     return await createChatMessage(payload);
   } catch (error) {
-    logger.warn('[CHAT HISTORY] Kh�ng th? luu l?ch s? chat:', error?.message || error);
+    logger.warn('[CHAT HISTORY] Không thể lưu lịch sử chat:', error?.message || error);
     return null;
   }
 };
@@ -57,40 +57,98 @@ const parseMessageId = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+const isValidUuid = (value) => {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+};
+
+/**
+ * Gọi API tới hệ thống RAG Python (Rag_System_AI).
+ */
+export const callRagSystemService = async ({ query, projectId, userId, topK = 5, model, temperature }) => {
+  const rawBaseUrl = process.env.RAG_SERVICE_URL || 'http://127.0.0.1:8001';
+  const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+  const ragUrl = `${baseUrl}/api/v1/chat`;
+  logger.info(`[CHAT RAG AI] Đang gửi yêu cầu tới Rag_System_AI: ${ragUrl}`);
+
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.AI_TIMEOUT_MS) || 120000;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(ragUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query,
+        project_id: projectId ? Number(projectId) : undefined,
+        user_id: userId ? String(userId) : undefined,
+        top_k: topK,
+        model: model || undefined,
+        temperature: temperature || undefined,
+        save_history: false, // Quản lý lưu history tập trung tại Trending BE để đồng bộ DB
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Rag_System_AI HTTP error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json();
+    return {
+      answer: data.answer || '',
+      model: data.model || 'rag-system-ai',
+      citations: data.citations || [],
+      contexts: data.contexts || [],
+      latencyBreakdown: data.latency_breakdown || {},
+      tokens: {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+      },
+    };
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error(`Hết thời gian kết nối tới Rag_System_AI (${timeoutMs}ms)`);
+    }
+    throw error;
+  }
+};
+
 export const chatRagSystem = async (request, reply) => {
   const requestBody = request.body;
   const projectId = parseProjectId(requestBody ? (requestBody.project_id || requestBody.projectId) : null);
-  const userId = request.user?.user_id;
+  const rawUserId = request.user?.user_id || requestBody?.user_id || null;
+  const userId = isValidUuid(rawUserId) ? rawUserId : null;
   const startedAt = Date.now();
+  const userQuestion = requestBody ? (requestBody.message || requestBody.query) : null;
 
-  if (!requestBody || !requestBody.message) {
+  if (!requestBody || !userQuestion) {
     return reply.status(400).send({
       success: false,
-      message: 'Message is required'
+      message: 'Message (hoặc query) là bắt buộc.'
     });
   }
 
   if (!projectId) {
     return reply.status(400).send({
       success: false,
-      message: 'project_id (or projectId) is required'
-    });
-  }
-
-  if (!userId) {
-    return reply.status(401).send({
-      success: false,
-      message: 'Vui l�ng dang nh?p d? ti?p t?c.'
+      message: 'project_id (hoặc projectId) là bắt buộc.'
     });
   }
 
   let userMessage = null;
 
   try {
-    const userQuestion = requestBody.message;
     const cacheKey = buildChatCacheKey(projectId, userQuestion);
 
-    logger.info(`[CHAT API] Nh?n y�u c?u: ${userQuestion} (Project ID: ${projectId}, User ID: ${userId})`);
+    logger.info(`[CHAT API] Nhận yêu cầu: ${userQuestion} (Project ID: ${projectId}, User ID: ${userId})`);
 
     userMessage = await saveChatMessageSafely({
       projectId,
@@ -119,6 +177,10 @@ export const chatRagSystem = async (request, reply) => {
           return reply.status(200).send({
             success: true,
             answer: parsedResult.answer,
+            model: 'cache',
+            citations: parsedResult.citations || [],
+            contexts: parsedResult.contexts || [],
+            table: parsedResult.table || null,
             messages: {
               user_message_id: userMessage?.message_id || null,
               assistant_message_id: assistantMessage?.message_id || null
@@ -127,21 +189,43 @@ export const chatRagSystem = async (request, reply) => {
         }
         logger.info(`[CHAT CACHE] Cache miss cho Project ID: ${projectId}, Key: ${cacheKey}`);
       } catch (cacheError) {
-        logger.warn('[CHAT CACHE] Kh�ng th? d?c cache Redis, ti?p t?c x? l� pipeline:', cacheError?.message || cacheError);
+        logger.warn('[CHAT CACHE] Không thể đọc cache Redis, tiếp tục xử lý pipeline:', cacheError?.message || cacheError);
       }
     }
 
-    const result = await chatPipeline(userQuestion, projectId, userId);
+    let result = null;
+    let fromFallback = false;
+    let modelName = 'rag-system-ai';
 
-    if (redisClient?.isOpen && !result.fromFallback) {
+    try {
+      // 1. Ưu tiên kết nối trực tiếp tới Rag_System_AI (FastAPI service)
+      result = await callRagSystemService({
+        query: userQuestion,
+        projectId,
+        userId,
+        topK: requestBody.top_k || requestBody.topK || 5,
+        model: requestBody.model,
+        temperature: requestBody.temperature
+      });
+      modelName = result.model || modelName;
+      logger.info(`[CHAT RAG AI] Xử lý thành công từ Rag_System_AI (Model: ${modelName})`);
+    } catch (ragServiceError) {
+      logger.warn(`[CHAT RAG AI] Rag_System_AI không phản hồi hoặc xảy ra lỗi: ${ragServiceError.message}. Chuyển sang Fallback Pipeline nội bộ...`);
+      // 2. Dự phòng bằng chatPipeline nội bộ
+      result = await chatPipeline(userQuestion, projectId, userId);
+      fromFallback = result.fromFallback ?? true;
+      modelName = getActiveChatModel();
+    }
+
+    if (redisClient?.isOpen && !fromFallback) {
       try {
         await redisSet(cacheKey, JSON.stringify(result), CHAT_CACHE_TTL_SECONDS);
-        logger.info(`[CHAT CACHE] �� luu cache cho Project ID: ${projectId}, Key: ${cacheKey}`);
+        logger.info(`[CHAT CACHE] Đã lưu cache cho Project ID: ${projectId}, Key: ${cacheKey}`);
       } catch (cacheError) {
-        logger.warn('[CHAT CACHE] Kh�ng th? luu cache Redis:', cacheError?.message || cacheError);
+        logger.warn('[CHAT CACHE] Không thể lưu cache Redis:', cacheError?.message || cacheError);
       }
-    } else if (result.fromFallback) {
-      logger.info('[CHAT CACHE] B? qua luu cache v� AI d�ng Smart Fallback (k?t qu? c� th? chua t?i uu).');
+    } else if (fromFallback) {
+      logger.info('[CHAT CACHE] Bỏ qua lưu cache vì AI dùng Fallback (kết quả có thể chưa tối ưu).');
     }
 
     const assistantMessage = await saveChatMessageSafely({
@@ -149,30 +233,34 @@ export const chatRagSystem = async (request, reply) => {
       userId,
       role: 'ASSISTANT',
       content: result.answer,
-      model: getActiveChatModel(),
+      model: modelName,
       promptTokens: result.tokens?.promptTokens || 0,
       completionTokens: result.tokens?.completionTokens || 0,
       totalTokens: result.tokens?.totalTokens || 0,
       latencyMs: Date.now() - startedAt,
-      status: result.fromFallback ? 'ERROR' : 'COMPLETED'
+      status: fromFallback ? 'ERROR' : 'COMPLETED'
     });
 
     return reply.status(200).send({
       success: true,
       answer: result.answer,
+      model: modelName,
+      citations: result.citations || [],
+      contexts: result.contexts || [],
+      table: result.table || null,
       messages: {
         user_message_id: userMessage?.message_id || null,
         assistant_message_id: assistantMessage?.message_id || null
       }
     });
   } catch (error) {
-    logger.error('[CHAT API] L?i x? l� y�u c?u Chatbot:', error);
+    logger.error('[CHAT API] Lỗi xử lý yêu cầu Chatbot:', error);
 
     await saveChatMessageSafely({
       projectId,
       userId,
       role: 'ASSISTANT',
-      content: '�� x?y ra l?i h? th?ng, vui l�ng th? l?i sau.',
+      content: 'Đã xảy ra lỗi hệ thống, vui lòng thử lại sau.',
       model: getActiveChatModel(),
       latencyMs: Date.now() - startedAt,
       status: 'ERROR'
@@ -180,7 +268,7 @@ export const chatRagSystem = async (request, reply) => {
 
     return reply.status(500).send({
       success: false,
-      message: '�� x?y ra l?i h? th?ng, vui l�ng th? l?i sau.'
+      message: 'Đã xảy ra lỗi hệ thống, vui lòng thử lại sau.'
     });
   }
 };
@@ -209,8 +297,8 @@ export const createChatMessageHandler = async (request, reply) => {
 
     return reply.status(201).send({ success: true, data: message });
   } catch (error) {
-    logger.error('[CHAT MESSAGE] L?i t?o message:', error);
-    return reply.status(500).send({ success: false, message: '�� x?y ra l?i khi t?o chat message.' });
+    logger.error('[CHAT MESSAGE] Lỗi tạo message:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi tạo chat message.' });
   }
 };
 
@@ -231,8 +319,8 @@ export const getChatHistory = async (request, reply) => {
 
     return reply.status(200).send({ success: true, data: messages });
   } catch (error) {
-    logger.error('[CHAT MESSAGE] L?i l?y l?ch s? chat:', error);
-    return reply.status(500).send({ success: false, message: '�� x?y ra l?i khi l?y l?ch s? chat.' });
+    logger.error('[CHAT MESSAGE] Lỗi lấy lịch sử chat:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi lấy lịch sử chat.' });
   }
 };
 
@@ -253,8 +341,8 @@ export const getChatMessageDetail = async (request, reply) => {
 
     return reply.status(200).send({ success: true, data: message });
   } catch (error) {
-    logger.error('[CHAT MESSAGE] L?i l?y chi ti?t message:', error);
-    return reply.status(500).send({ success: false, message: '�� x?y ra l?i khi l?y chi ti?t chat message.' });
+    logger.error('[CHAT MESSAGE] Lỗi lấy chi tiết message:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi lấy chi tiết chat message.' });
   }
 };
 
@@ -268,15 +356,15 @@ export const updateChatMessageHandler = async (request, reply) => {
       return reply.status(400).send({ success: false, message: 'projectId or messageId is invalid' });
     }
 
-    const message = await updateChatMessage(messageId, projectId, userId, request.body);
+    const message = await updateChatMessage(messageId, projectId, request.body, userId);
     if (!message) {
       return reply.status(404).send({ success: false, message: 'Chat message not found' });
     }
 
     return reply.status(200).send({ success: true, data: message });
   } catch (error) {
-    logger.error('[CHAT MESSAGE] L?i c?p nh?t message:', error);
-    return reply.status(500).send({ success: false, message: '�� x?y ra l?i khi c?p nh?t chat message.' });
+    logger.error('[CHAT MESSAGE] Lỗi cập nhật message:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi cập nhật chat message.' });
   }
 };
 
@@ -293,24 +381,81 @@ export const deleteChatMessageHandler = async (request, reply) => {
     const result = await deleteChatMessage(messageId, projectId, userId);
     return reply.status(200).send({ success: true, ...result });
   } catch (error) {
-    logger.error('[CHAT MESSAGE] L?i x�a m?t message:', error);
-    return reply.status(500).send({ success: false, message: '�� x?y ra l?i khi x�a chat message.' });
+    logger.error('[CHAT MESSAGE] Lỗi xóa một message:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi xóa chat message.' });
   }
 };
 
 export const clearChatHistory = async (request, reply) => {
   try {
     const projectId = parseProjectId(request.params.projectId);
-    const userId = request.user?.user_id;
+    const rawUserId = request.user?.user_id || null;
+    const userId = isValidUuid(rawUserId) ? rawUserId : null;
 
     if (!projectId) {
       return reply.status(400).send({ success: false, message: 'projectId is invalid' });
     }
 
     const result = await deleteProjectChatMessages(projectId, userId);
+
+    // Đồng bộ reset context memory bên Rag_System_AI
+    try {
+      const rawBaseUrl = process.env.RAG_SERVICE_URL || 'http://127.0.0.1:8001';
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      const params = new URLSearchParams();
+      params.append('project_id', String(projectId));
+      if (userId) params.append('user_id', String(userId));
+      await fetch(`${baseUrl}/api/v1/chat/context/reset?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      logger.info(`[CHAT CLEAR] Đã xóa context memory bên Rag_System_AI cho Project ID: ${projectId}`);
+    } catch (ragError) {
+      logger.warn('[CHAT CLEAR] Không thể gọi reset context tới Rag_System_AI:', ragError?.message || ragError);
+    }
+
     return reply.status(200).send({ success: true, ...result });
   } catch (error) {
-    logger.error('[CHAT MESSAGE] L?i x�a l?ch s? chat:', error);
-    return reply.status(500).send({ success: false, message: '�� x?y ra l?i khi x�a l?ch s? chat.' });
+    logger.error('[CHAT MESSAGE] Lỗi xóa lịch sử chat:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi xóa lịch sử chat.' });
+  }
+};
+
+/**
+ * Tạo mới phiên trò chuyện: reset context memory bên AI mà không nhất thiết phải xóa dữ liệu cũ
+ */
+export const resetChatConversation = async (request, reply) => {
+  try {
+    const projectId = parseProjectId(request.params.projectId);
+    const rawUserId = request.user?.user_id || request.body?.user_id || null;
+    const userId = isValidUuid(rawUserId) ? rawUserId : null;
+
+    if (!projectId) {
+      return reply.status(400).send({ success: false, message: 'projectId is invalid' });
+    }
+
+    // Gửi yêu cầu reset context memory sang Rag_System_AI
+    try {
+      const rawBaseUrl = process.env.RAG_SERVICE_URL || 'http://127.0.0.1:8001';
+      const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+      const params = new URLSearchParams();
+      params.append('project_id', String(projectId));
+      if (userId) params.append('user_id', String(userId));
+      await fetch(`${baseUrl}/api/v1/chat/context/reset?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      logger.info(`[CHAT RESET] Đã reset working context memory cho Project ID: ${projectId}`);
+    } catch (ragError) {
+      logger.warn('[CHAT RESET] Không thể gọi reset context tới Rag_System_AI:', ragError?.message || ragError);
+    }
+
+    return reply.status(200).send({
+      success: true,
+      message: 'Bắt đầu phiên trò chuyện mới thành công.'
+    });
+  } catch (error) {
+    logger.error('[CHAT RESET] Lỗi tạo mới cuộc trò chuyện:', error);
+    return reply.status(500).send({ success: false, message: 'Đã xảy ra lỗi khi tạo mới cuộc trò chuyện.' });
   }
 };

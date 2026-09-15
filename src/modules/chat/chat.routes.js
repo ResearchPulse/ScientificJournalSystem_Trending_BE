@@ -6,9 +6,10 @@ import {
   deleteChatMessageHandler,
   getChatHistory,
   getChatMessageDetail,
+  resetChatConversation,
   updateChatMessageHandler
 } from './chat.controller.js';
-import { requireAuth } from '../auth/auth.middleware.js';
+import { requireAuth, optionalAuth } from '../auth/auth.middleware.js';
 import { chatRateLimiter } from '../core/rateLimiter.middleware.js';
 import { parseCookies } from '../../utils/authToken.utils.js';
 
@@ -212,7 +213,7 @@ fastify.get('/debug-auth', (req, res) => {
   return res.json(payload);
 });
 
-fastify.post('/chat', { preHandler: [requireAuth, chatRateLimiter] }, chatRagSystem);
+fastify.post('/chat', { preHandler: [optionalAuth, chatRateLimiter] }, chatRagSystem);
 
 /**
  * @openapi
@@ -320,9 +321,10 @@ fastify.post('/chat', { preHandler: [requireAuth, chatRateLimiter] }, chatRagSys
  *                   type: integer
  *                   example: 10
  */
-fastify.post('/projects/:projectId/chat/messages', { preHandler: [requireAuth] }, createChatMessageHandler);
-fastify.get('/projects/:projectId/chat/messages', { preHandler: [requireAuth] }, getChatHistory);
-fastify.delete('/projects/:projectId/chat/messages', { preHandler: [requireAuth] }, clearChatHistory);
+fastify.post('/projects/:projectId/chat/messages', { preHandler: [optionalAuth] }, createChatMessageHandler);
+fastify.get('/projects/:projectId/chat/messages', { preHandler: [optionalAuth] }, getChatHistory);
+fastify.delete('/projects/:projectId/chat/messages', { preHandler: [optionalAuth] }, clearChatHistory);
+fastify.post('/projects/:projectId/chat/reset', { preHandler: [optionalAuth] }, resetChatConversation);
 
 /**
  * @openapi

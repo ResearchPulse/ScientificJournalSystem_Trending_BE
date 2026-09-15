@@ -228,13 +228,23 @@ export const deleteChatMessage = async (messageId, projectId, userId) => {
   return { deleted_count: result.rowCount };
 };
 
-export const deleteProjectChatMessages = async (projectId, userId) => {
-  const query = `
-    DELETE FROM "Project_Chat_Message"
-    WHERE project_id = $1
-      AND user_id = $2::uuid;
-  `;
+export const deleteProjectChatMessages = async (projectId, userId = null) => {
+  let query, params;
+  if (userId) {
+    query = `
+      DELETE FROM "Project_Chat_Message"
+      WHERE project_id = $1
+        AND user_id = $2::uuid;
+    `;
+    params = [projectId, userId];
+  } else {
+    query = `
+      DELETE FROM "Project_Chat_Message"
+      WHERE project_id = $1;
+    `;
+    params = [projectId];
+  }
 
-  const result = await pool.query(query, [projectId, userId]);
+  const result = await pool.query(query, params);
   return { deleted_count: result.rowCount };
 };
